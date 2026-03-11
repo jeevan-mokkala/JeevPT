@@ -57,6 +57,9 @@ class MessageDataset(Dataset):
             msg_tokens = self.tokenizer.encode(formatted_msg)
             msg_length = len(msg_tokens)
 
+            if msg_length > self.sequence_length:
+                continue
+
             if current_length + msg_length > self.sequence_length and current_sequence:
                 self.sequences.append("".join(current_sequence))
                 current_sequence = []
@@ -105,11 +108,7 @@ class MessageDataset(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        encoded = self.tokenizer.encode(
-            self.sequences[idx],
-            max_length=self.sequence_length,
-            truncation=True,
-        )
+        encoded = self.tokenizer.encode(self.sequences[idx])
         return torch.tensor(encoded, dtype=torch.long)
 
 
@@ -133,6 +132,16 @@ def get_json_files(data_dir="data"):
     if not json_files:
         raise FileNotFoundError(f"No message JSON files found in {data_dir}")
     return json_files
+
+
+def split_dataset(dataset, train=0.8, val=0.1, test=0.1, seed=42):
+    from torch.utils.data import random_split
+    n = len(dataset)
+    train_n = int(n * train)
+    val_n = int(n * val)
+    test_n = n - train_n - val_n
+    return random_split(dataset, [train_n, val_n, test_n],
+                        generator=torch.Generator().manual_seed(seed))
 
 
 def collate_fn(batch, pad_token_id):

@@ -10,18 +10,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import GPT2Tokenizer
-from data import MessageDataset, setup_tokenizer, get_json_files, collate_fn, create_input_target_pairs
+from data import MessageDataset, setup_tokenizer, get_json_files, split_dataset, collate_fn, create_input_target_pairs
 
 
 # --- Data ---
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 setup_tokenizer(tokenizer)
 
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+DATA_DIR = os.environ.get("SM_CHANNEL_TRAINING", os.path.join(PROJECT_ROOT, "data"))
 json_files = get_json_files(DATA_DIR)
-dataset = MessageDataset(json_files, tokenizer=tokenizer, sequence_length=256)
+full_dataset = MessageDataset(json_files, tokenizer=tokenizer, sequence_length=256)
+train_dataset, val_dataset, test_dataset = split_dataset(full_dataset)
 dataloader = DataLoader(
-    dataset,
+    train_dataset,
     batch_size=8,
     shuffle=True,
     collate_fn=lambda batch: collate_fn(batch, tokenizer.pad_token_id),
@@ -31,7 +32,7 @@ VOCAB_SIZE = len(tokenizer)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 print(f"Vocab size: {VOCAB_SIZE}")
-print(f"Dataset: {len(dataset)} sequences | {len(dataloader)} batches")
+print(f"Dataset: {len(full_dataset)} total | {len(train_dataset)} train | {len(val_dataset)} val | {len(test_dataset)} test")
 print(f"Device: {DEVICE}")
 
 
@@ -134,6 +135,7 @@ class GPT2Small(nn.Module):
 
 # --- Training ---
 import argparse
+import json
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -144,12 +146,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--output", type=str, default="output")
+    parser.add_argument("--output", type=str, default=os.environ.get("SM_MODEL_DIR", "output"))
     args = parser.parse_args()
 
     # Rebuild dataloader with custom batch size
     dataloader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=lambda batch: collate_fn(batch, tokenizer.pad_token_id),
@@ -166,13 +168,23 @@ if __name__ == "__main__":
     print(f"Model: d={args.d_model}, blocks={args.num_blocks}, heads={args.num_heads} | {total_params/1e6:.1f}M params")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs * len(dataloader))
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: collate_fn(batch, tokenizer.pad_token_id),
+    )
+
+    history = {"train_loss": [], "val_loss": [], "lr": []}
     start = time.time()
 
     for epoch in range(args.epochs):
+        model.train()
         epoch_loss = 0
-        for batch in tqdm(dataloader, desc=f"Epoch: {epoch}"):
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch} [train]"):
             optimizer.zero_grad()
             x, y = create_input_target_pairs(batch.to(DEVICE))
             pred = model(x)
@@ -180,12 +192,31 @@ if __name__ == "__main__":
             epoch_loss += loss.item()
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
-        print(f"Epoch {epoch}: {epoch_loss / len(dataloader)}")
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                x, y = create_input_target_pairs(batch.to(DEVICE))
+                pred = model(x)
+                val_loss += loss_fn(pred.reshape(-1, pred.size(-1)), y.reshape(-1)).item()
+
+        train_avg = epoch_loss / len(dataloader)
+        val_avg = val_loss / len(val_loader)
+        cur_lr = scheduler.get_last_lr()[0]
+        history["train_loss"].append(train_avg)
+        history["val_loss"].append(val_avg)
+        history["lr"].append(cur_lr)
+        print(f"Epoch {epoch}: train={train_avg:.4f} val={val_avg:.4f} lr={cur_lr:.2e}")
 
     print(f"Model training complete in {time.time() - start:.1f}s")
 
     os.makedirs(args.output, exist_ok=True)
     model_path = os.path.join(args.output, "model.pt")
     torch.save(model.state_dict(), model_path)
+    history_path = os.path.join(args.output, "history.json")
+    with open(history_path, "w") as f:
+        json.dump(history, f)
     print(f"Model saved to {model_path}")
+    print(f"History saved to {history_path}")
